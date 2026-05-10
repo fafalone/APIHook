@@ -1,0 +1,377 @@
+[Description("")]
+[FormDesignerId("D61AAEB4-ECC5-45AE-8C1E-561572633B3F")]
+[PredeclaredId]
+Class Form1
+
+ 
+    
+    Private Sub Command1_Click() Handles Command1.Click
+        Demo_Install
+        MessageBox Me.hWnd, "test", "cap", MB_OK
+        Demo_Remove
+    End Sub
+    
+    ' ====================================================================== '
+    '  EXAMPLE USAGE                                                          '
+    ' ====================================================================== '
+    '
+     ' 1. Declare the original function signature via a delegate approach 
+     Private Delegate Function fn_MessageBoxW _
+         ( _
+             ByVal hWnd As LongPtr, _
+             ByVal lpText As LongPtr, _
+             ByVal lpCaption As LongPtr, _
+             ByVal uType As Long) As Long
+     
+     Private g_Hook As HookDescriptor
+    
+     ' 2. Your hook / replacement function
+     Public Function Hook_MessageBoxW(ByVal hWnd As LongPtr, _
+                                      ByVal lpText As LongPtr, _
+                                      ByVal lpCaption As LongPtr, _
+                                      ByVal uType As Long) As Long
+         Debug.Print "MessageBoxW intercepted!"
+         ' Call the original through the trampoline 
+         Dim pfnOrig As fn_MessageBoxW = g_Hook.TrampolineAddress
+         Hook_MessageBoxW = pfnOrig(hWnd, lpText, lpCaption, uType)
+     End Function
+    
+     ' 3. Install / remove
+     Sub Demo_Install()
+         Dim ok As Boolean
+         ok = InstallHook("user32.dll", "MessageBoxW", _
+                          AddressOf Hook_MessageBoxW, g_Hook)
+         If ok Then Debug.Print "Hook installed."
+     End Sub
+    
+     Sub Demo_Remove()
+         If RemoveHook(g_Hook) Then Debug.Print "Hook removed."
+     End Sub
+    '
+End Class
+
+
+Module APIHook
+ 
+        ' ------------------------------------------------------------------ '
+        '  Constants                                                          '
+        ' ------------------------------------------------------------------ '
+
+ 
+        ' Patch sizes
+        Private Const PATCH_SIZE_X86 As Long = 5   ' E9 rel32
+        Private Const PATCH_SIZE_X64 As Long = 14  ' FF 25 00000000 + absolute addr
+
+        ' ------------------------------------------------------------------ '
+        '  Hook descriptor – one per installed hook                           '
+        ' ------------------------------------------------------------------ '
+
+        Public Type HookDescriptor
+            TargetAddress    As LongPtr   ' Address of the hooked function
+            TrampolineAddress As LongPtr  ' Executable trampoline (call original here)
+            OriginalBytes(0 To 13) As Byte' Up to 14 saved bytes
+            PatchSize        As Long      ' 5 (x86) or 14 (x64)
+            IsInstalled      As Boolean
+        End Type
+
+        ' ------------------------------------------------------------------ '
+        '  Private helpers                                                    '
+        ' ------------------------------------------------------------------ '
+
+        ' Returns True when the host process is 64-bit
+        Private Function Is64Bit() As Boolean
+    #If Win64 Then
+            Is64Bit = True
+    #Else
+            Is64Bit = False
+    #End If
+        End Function
+
+        ' Read N bytes from an arbitrary address into a Byte array
+        Private Sub ReadBytes(ByVal address As LongPtr, _
+                              ByRef buf() As Byte, _
+                              ByVal count As Long)
+            RtlMoveMemory ByVal VarPtr(buf(0)), ByVal address, CLngPtr(count)
+        End Sub
+
+        ' Write a Byte array to an arbitrary address
+        Private Sub WriteBytes(ByVal address As LongPtr, _
+                               ByRef buf() As Byte, _
+                               ByVal count As Long)
+            RtlMoveMemory ByVal address, ByVal VarPtr(buf(0)), CLngPtr(count)
+        End Sub
+
+        ' Write a single byte
+        Private Sub WriteByte(ByVal address As LongPtr, ByVal value As Byte)
+            Dim b(0) As Byte
+            b(0) = value
+            WriteBytes address, b, 1
+        End Sub
+
+        ' Write a 32-bit little-endian integer to address
+        Private Sub WriteDWord(ByVal address As LongPtr, ByVal value As Long)
+            Dim b(3) As Byte
+            RtlMoveMemory ByVal VarPtr(b(0)), ByVal VarPtr(value), 4
+            WriteBytes address, b, 4
+        End Sub
+
+        ' Write a 64-bit little-endian integer to address (x64 only)
+        Private Sub WriteQWord(ByVal address As LongPtr, ByVal value As LongPtr)
+            Dim b(7) As Byte
+            Dim tmp  As LongPtr
+            tmp = value
+            Dim i As Integer
+            For i = 0 To 7
+                b(i) = CByte(tmp And &HFF)
+                tmp = tmp \ &H100
+            Next i
+            WriteBytes address, b, 8
+        End Sub
+
+        ' Unlock memory, execute callback (write patch), re-lock
+        Private Function ProtectedWrite(ByVal address As LongPtr, _
+                                        ByVal patchSize As Long, _
+                                        ByRef patch() As Byte) As Boolean
+            Dim oldProtect As Long
+            If VirtualProtect(address, CLngPtr(patchSize), _
+                              PAGE_EXECUTE_READWRITE, oldProtect) = 0 Then
+                ProtectedWrite = False
+                Exit Function
+            End If
+
+            WriteBytes address, patch, patchSize
+
+            VirtualProtect address, CLngPtr(patchSize), oldProtect, oldProtect
+            FlushInstructionCache GetCurrentProcess(), address, CLngPtr(patchSize)
+            ProtectedWrite = True
+        End Function
+
+        ' ------------------------------------------------------------------ '
+        '  Build the jump-patch bytes                                         '
+        ' ------------------------------------------------------------------ '
+
+    
+        ' x86: E9 <rel32>   (relative near jump)
+        ' IMPORTANT: rel is a signed Long. We must copy its raw bytes with
+        ' RtlMoveMemory rather than using integer division (\), which
+        ' sign-extends and corrupts the byte values for negative displacements.
+        Private Function BuildPatchX86(ByVal from_ As LongPtr, _
+                                       ByVal to_ As LongPtr) As Byte()
+            Dim patch(4) As Byte
+            Dim rel As Long
+            rel = CLng(to_ - from_ - 5)   ' signed relative displacement
+            patch(0) = &HE9
+            ' Copy all 4 bytes of rel directly — preserves two's-complement bit pattern
+            RtlMoveMemory ByVal VarPtr(patch(1)), ByVal VarPtr(rel), 4
+            BuildPatchX86 = patch
+        End Function
+
+        ' x64: FF 25 00000000 <abs64>  (absolute indirect jump through RIP+0)
+        Private Function BuildPatchX64(ByVal to_ As LongPtr) As Byte()
+            Dim patch(13) As Byte
+            ' FF 25 00 00 00 00 = JMP QWORD PTR [RIP+0]
+            patch(0) = &HFF
+            patch(1) = &H25
+            patch(2) = &H00
+            patch(3) = &H00
+            patch(4) = &H00
+            patch(5) = &H00
+            ' 8-byte absolute address (little-endian)
+            Dim tmp As LongPtr: tmp = to_
+            Dim i As Integer
+            For i = 0 To 7
+                patch(6 + i) = CByte(tmp And &HFF)
+                tmp = tmp \ &H100
+            Next i
+            BuildPatchX64 = patch
+        End Function
+
+        ' ------------------------------------------------------------------ '
+        '  Trampoline builder                                                 '
+        ' ------------------------------------------------------------------ '
+        '
+        ' Allocate executable memory within 2 GB of 'nearAddr' so that a
+        ' rel32 JMP from the trampoline back into the module never overflows.
+        ' On x64 we pass 0 (don't-care) since the patch uses an absolute addr.
+        Private Function AllocNearby(ByVal nearAddr As LongPtr, _
+                                     ByVal size As Long) As LongPtr
+    #If Win64 Then
+            ' x64 uses absolute indirect jumps — no proximity requirement.
+            AllocNearby = VirtualAlloc(0, CLngPtr(size), _
+                                       MEM_COMMIT Or MEM_RESERVE, _
+                                       PAGE_EXECUTE_READWRITE)
+    #Else
+            ' x86: rel32 range is ±2 GB.  Search in 64 KB steps outward from
+            ' the target until we find a free region within that window.
+            Dim maxDelta  As Long: maxDelta = &H70000000  ' ~1.75 GB, safe margin
+            Dim step      As Long: step = &H10000     ' 64 KB
+            Dim candidate As LongPtr
+            Dim result    As LongPtr
+            Dim delta     As Long
+
+            For delta = step To maxDelta Step step
+                ' Try above
+                candidate = nearAddr + CLngPtr(delta)
+                result = VirtualAlloc(candidate, CLngPtr(size), _
+                                      MEM_COMMIT Or MEM_RESERVE, _
+                                      PAGE_EXECUTE_READWRITE)
+                If result <> 0 Then
+                    AllocNearby = result
+                    Exit Function
+                End If
+                ' Try below
+                candidate = nearAddr - CLngPtr(delta)
+                If candidate > 0 Then
+                    result = VirtualAlloc(candidate, CLngPtr(size), _
+                                          MEM_COMMIT Or MEM_RESERVE, _
+                                          PAGE_EXECUTE_READWRITE)
+                    If result <> 0 Then
+                        AllocNearby = result
+                        Exit Function
+                    End If
+                End If
+            Next delta
+
+            AllocNearby = 0   ' failed
+    #End If
+        End Function
+        '
+        '  A trampoline is a small executable buffer that:
+        '    [saved original bytes]  (5 or 14 bytes)
+        '    [jump back to target+patchSize]
+        '
+        '  Calling the trampoline is equivalent to calling the real function.
+        '
+        Private Function BuildTrampoline(ByVal targetAddr As LongPtr, _
+                                         ByRef origBytes() As Byte, _
+                                         ByVal patchSize As Long) As LongPtr
+            Dim trampolineSize As Long
+            If Is64Bit() Then
+                trampolineSize = patchSize + PATCH_SIZE_X64  ' saved + jump back
+            Else
+                trampolineSize = patchSize + PATCH_SIZE_X86
+            End If
+
+            ' Allocate RWX memory for the trampoline.
+            ' On x86 the trampoline's jump-back uses a rel32, so it must land
+            ' within 2 GB of the target function.
+            Dim tAddr As LongPtr
+            tAddr = AllocNearby(targetAddr, trampolineSize)
+            If tAddr = 0 Then
+                BuildTrampoline = 0
+                Exit Function
+            End If
+
+            ' Write the saved original bytes
+            WriteBytes tAddr, origBytes, patchSize
+
+            ' Write the jump back to (target + patchSize)
+            Dim resumeAddr As LongPtr
+            resumeAddr = targetAddr + CLngPtr(patchSize)
+
+            If Is64Bit() Then
+                Dim backPatch64() As Byte
+                backPatch64 = BuildPatchX64(resumeAddr)
+                WriteBytes tAddr + CLngPtr(patchSize), backPatch64, PATCH_SIZE_X64
+            Else
+                Dim backPatch32() As Byte
+                backPatch32 = BuildPatchX86(tAddr + CLngPtr(patchSize), resumeAddr)
+                WriteBytes tAddr + CLngPtr(patchSize), backPatch32, PATCH_SIZE_X86
+            End If
+
+            FlushInstructionCache GetCurrentProcess(), tAddr, CLngPtr(trampolineSize)
+            BuildTrampoline = tAddr
+        End Function
+        
+        ' ------------------------------------------------------------------ '
+        '  Public API                                                         '
+        ' ------------------------------------------------------------------ '
+
+        '
+        ' InstallHook
+        '   moduleName  - DLL name, e.g. "user32.dll"
+        '   procName    - Export name, e.g. "MessageBoxW"
+        '   hookProc    - Address of your replacement function (use AddressOf)
+        '   hook        - [out] HookDescriptor to pass to RemoveHook later
+        '
+        ' Returns True on success.
+        '
+        Public Function InstallHook(ByVal moduleName As String, _
+                                    ByVal procName As String, _
+                                    ByVal hookProc As LongPtr, _
+                                    ByRef hook As HookDescriptor) As Boolean
+            InstallHook = False
+
+            ' Resolve target address
+            Dim hMod As LongPtr
+            hMod = GetModuleHandleW(StrPtr(moduleName))
+            If hMod = 0 Then Exit Function
+
+            Dim targetAddr As LongPtr
+            targetAddr = GetProcAddress(hMod, procName)
+            If targetAddr = 0 Then Exit Function
+
+            ' Determine patch size for this architecture
+            Dim patchSize As Long
+            If Is64Bit() Then
+                patchSize = PATCH_SIZE_X64
+            Else
+                patchSize = PATCH_SIZE_X86
+            End If
+
+            ' Save original bytes
+            Dim origBytes(0 To 13) As Byte
+            ReadBytes targetAddr, origBytes, patchSize
+
+            ' Build trampoline (call this to invoke the real function)
+            Dim trampoline As LongPtr
+            trampoline = BuildTrampoline(targetAddr, origBytes, patchSize)
+            If trampoline = 0 Then Exit Function
+
+            ' Build and write the detour patch
+            Dim patch() As Byte
+            If Is64Bit() Then
+                patch = BuildPatchX64(hookProc)
+            Else
+                patch = BuildPatchX86(targetAddr, hookProc)
+            End If
+
+            If Not ProtectedWrite(targetAddr, patchSize, patch) Then
+                VirtualFree trampoline, 0, MEM_RELEASE
+                Exit Function
+            End If
+
+            ' Fill out descriptor
+            hook.TargetAddress = targetAddr
+            hook.TrampolineAddress = trampoline
+            CopyMemory hook.OriginalBytes(0), origBytes(0), UBound(origBytes) + 1
+            hook.PatchSize = patchSize
+            hook.IsInstalled = True
+
+            InstallHook = True
+        End Function
+
+        '
+        ' RemoveHook
+        '   Restores the original bytes and frees the trampoline.
+        '
+        Public Function RemoveHook(ByRef hook As HookDescriptor) As Boolean
+            RemoveHook = False
+            If Not hook.IsInstalled Then Exit Function
+
+            ' Restore original bytes
+            Dim origBytes(0 To 13) As Byte
+            ' origBytes = hook.OriginalBytes
+            CopyMemory origBytes(0), hook.OriginalBytes(0), UBound(origBytes) + 1
+            If Not ProtectedWrite(hook.TargetAddress, hook.PatchSize, origBytes) Then
+                Exit Function
+            End If
+
+            ' Free trampoline memory
+            VirtualFree hook.TrampolineAddress, 0, MEM_RELEASE
+
+            hook.IsInstalled = False
+            RemoveHook = True
+        End Function
+
+End Module
