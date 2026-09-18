@@ -196,9 +196,8 @@ Module APIHook
         ' On x64 we pass 0 (don't-care) since the patch uses an absolute addr.
         Private Function AllocNearby(ByVal nearAddr As LongPtr, _
                                      ByVal size As Long) As LongPtr
-            #If Win64 Then
-            Dim maxDelta As Long: maxDelta = &H70000000   ' ~1.75 GB, safe margin
-            Dim step As Long: step = &H10000              ' 64 KB
+            Dim maxDelta As Long = &H70000000   ' ~1.75 GB, safe margin
+            Dim step As Long = &H10000              ' 64 KB
             Dim candidate As LongPtr, result As LongPtr, delta As Long
 
             For delta = step To maxDelta Step step
@@ -218,40 +217,6 @@ Module APIHook
             Next delta
 
             Return 0
-            #Else
-            ' x86: rel32 range is ±2 GB.  Search in 64 KB steps outward from
-            ' the target until we find a free region within that window.
-            Dim maxDelta  As Long: maxDelta = &H70000000  ' ~1.75 GB, safe margin
-            Dim step      As Long: step = &H10000     ' 64 KB
-            Dim candidate As LongPtr
-            Dim result    As LongPtr
-            Dim delta     As Long
-
-            For delta = step To maxDelta Step step
-                ' Try above
-                candidate = nearAddr + CLngPtr(delta)
-                result = VirtualAlloc(candidate, CLngPtr(size), _
-                                      MEM_COMMIT Or MEM_RESERVE, _
-                                      PAGE_EXECUTE_READWRITE)
-                If result <> 0 Then
-                    AllocNearby = result
-                    Exit Function
-                End If
-                ' Try below
-                candidate = nearAddr - CLngPtr(delta)
-                If candidate > 0 Then
-                    result = VirtualAlloc(candidate, CLngPtr(size), _
-                                          MEM_COMMIT Or MEM_RESERVE, _
-                                          PAGE_EXECUTE_READWRITE)
-                    If result <> 0 Then
-                        AllocNearby = result
-                        Exit Function
-                    End If
-                End If
-            Next delta
-
-            AllocNearby = 0   ' failed
-            #End If
         End Function
         
         Private Function TryComputeRelDisp(ByVal origTarget As LongPtr, ByVal dstAddr As LongPtr, _
@@ -289,14 +254,14 @@ Module APIHook
                 End Select
             Loop
 
-        #If Win64 Then
+            #If Win64 Then
             ' REX prefix — 64-bit mode only. Same bytes are real opcodes on x86.
             If i < instrLen Then
                 If (buf(i) And &HF0) = &H40 Then
                     i = i + 1
                 End If
             End If
-        #End If
+            #End If
 
             Dim opcodeOffset As Long
             opcodeOffset = i
@@ -334,7 +299,7 @@ Module APIHook
                 Return True
             End If
 
-        #If Win64 Then
+            #If Win64 Then
             ' ModRM mod=00/rm=101 = RIP-relative on x64. On x86 the same pattern
             ' is [disp32] absolute — already correct as copied, nothing to do.
             Dim modrmOffset As Long
@@ -364,7 +329,7 @@ Module APIHook
                     End If
                 End If
             End If
-        #End If
+            #End If
 
             Return True
         End Function
@@ -420,13 +385,13 @@ Module APIHook
             Dim resumeAddr As LongPtr
             resumeAddr = targetAddr + CLngPtr(stolenLen)
 
-        #If Win64 Then
+            #If Win64 Then
             Dim backPatch() As Byte
             backPatch = BuildPatchX64(resumeAddr)
-        #Else
+            #Else
             Dim backPatch() As Byte
             backPatch = BuildPatchX86(tAddr + CLngPtr(stolenLen), resumeAddr)
-        #End If
+            #End If
             WriteBytes tAddr + CLngPtr(stolenLen), backPatch, patchSize
 
             FlushInstructionCache GetCurrentProcess(), tAddr, CLngPtr(trampolineSize)
