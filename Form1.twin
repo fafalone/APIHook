@@ -3,7 +3,8 @@
 [PredeclaredId]
 Class Form1
 
- 
+ ' **UPDATE - Now working both IDE and compiled, 32bit and 64bit, in most 
+ '            recent tB beta (983 at time of release).
     
     Private Sub Command1_Click() Handles Command1.Click
         Demo_Install
@@ -80,11 +81,11 @@ Module APIHook
 
         ' Returns True when the host process is 64-bit
         Private Function Is64Bit() As Boolean
-    #If Win64 Then
+        #If Win64 Then
             Is64Bit = True
-    #Else
+        #Else
             Is64Bit = False
-    #End If
+        #End If
         End Function
 
         ' Read N bytes from an arbitrary address into a Byte array
@@ -145,7 +146,7 @@ Module APIHook
             FlushInstructionCache GetCurrentProcess(), address, CLngPtr(patchSize)
             ProtectedWrite = True
         End Function
-
+ 
         ' ------------------------------------------------------------------ '
         '  Build the jump-patch bytes                                         '
         ' ------------------------------------------------------------------ '
@@ -195,12 +196,29 @@ Module APIHook
         ' On x64 we pass 0 (don't-care) since the patch uses an absolute addr.
         Private Function AllocNearby(ByVal nearAddr As LongPtr, _
                                      ByVal size As Long) As LongPtr
-    #If Win64 Then
-            ' x64 uses absolute indirect jumps — no proximity requirement.
-            AllocNearby = VirtualAlloc(0, CLngPtr(size), _
-                                       MEM_COMMIT Or MEM_RESERVE, _
-                                       PAGE_EXECUTE_READWRITE)
-    #Else
+            #If Win64 Then
+            Dim maxDelta As Long: maxDelta = &H70000000   ' ~1.75 GB, safe margin
+            Dim step As Long: step = &H10000              ' 64 KB
+            Dim candidate As LongPtr, result As LongPtr, delta As Long
+
+            For delta = step To maxDelta Step step
+                candidate = nearAddr + CLngPtr(delta)
+                result = VirtualAlloc(candidate, CLngPtr(size), MEM_COMMIT Or MEM_RESERVE, PAGE_EXECUTE_READWRITE)
+                If result <> 0 Then
+                    Return result
+                End If
+
+                candidate = nearAddr - CLngPtr(delta)
+                If candidate > 0 Then
+                    result = VirtualAlloc(candidate, CLngPtr(size), MEM_COMMIT Or MEM_RESERVE, PAGE_EXECUTE_READWRITE)
+                    If result <> 0 Then
+                        Return result
+                    End If
+                End If
+            Next delta
+
+            Return 0
+            #Else
             ' x86: rel32 range is ±2 GB.  Search in 64 KB steps outward from
             ' the target until we find a free region within that window.
             Dim maxDelta  As Long: maxDelta = &H70000000  ' ~1.75 GB, safe margin
@@ -233,56 +251,636 @@ Module APIHook
             Next delta
 
             AllocNearby = 0   ' failed
-    #End If
+            #End If
         End Function
-        '
-        '  A trampoline is a small executable buffer that:
-        '    [saved original bytes]  (5 or 14 bytes)
-        '    [jump back to target+patchSize]
-        '
-        '  Calling the trampoline is equivalent to calling the real function.
-        '
-        Private Function BuildTrampoline(ByVal targetAddr As LongPtr, _
-                                         ByRef origBytes() As Byte, _
-                                         ByVal patchSize As Long) As LongPtr
-            Dim trampolineSize As Long
-            If Is64Bit() Then
-                trampolineSize = patchSize + PATCH_SIZE_X64  ' saved + jump back
-            Else
-                trampolineSize = patchSize + PATCH_SIZE_X86
+        
+        Private Function TryComputeRelDisp(ByVal origTarget As LongPtr, ByVal dstAddr As LongPtr, _
+            ByVal instrLen As Long, ByRef newDisp As Long) As Boolean
+
+            Dim diff As LongPtr
+            diff = origTarget - (dstAddr + CLngPtr(instrLen))
+
+            Dim minInt32 As LongPtr, maxInt32 As LongPtr
+            minInt32 = -2147483647 - 1   ' avoids literal-overflow parsing -2147483648 directly
+            maxInt32 = 2147483647
+
+            If diff < minInt32 Or diff > maxInt32 Then
+                Return False
             End If
 
-            ' Allocate RWX memory for the trampoline.
-            ' On x86 the trampoline's jump-back uses a rel32, so it must land
-            ' within 2 GB of the target function.
+            newDisp = CLng(diff)
+            Return True
+        End Function
+ 
+        Private Function CopyRelocatedInstruction(ByVal srcAddr As LongPtr, _
+            ByVal dstAddr As LongPtr, ByVal instrLen As Long) As Boolean
+
+            Dim buf(0 To 14) As Byte
+            ReadBytes srcAddr, buf, instrLen
+
+            Dim i As Long
+            i = 0
+            Do While i < instrLen
+                Select Case buf(i)
+                    Case &H66, &H67, &HF0, &HF2, &HF3, &H2E, &H36, &H3E, &H26, &H64, &H65
+                        i = i + 1
+                    Case Else
+                        Exit Do
+                End Select
+            Loop
+
+        #If Win64 Then
+            ' REX prefix — 64-bit mode only. Same bytes are real opcodes on x86.
+            If i < instrLen Then
+                If (buf(i) And &HF0) = &H40 Then
+                    i = i + 1
+                End If
+            End If
+        #End If
+
+            Dim opcodeOffset As Long
+            opcodeOffset = i
+            Dim opByte As Byte
+            opByte = buf(opcodeOffset)
+
+            If opByte = &HEB Or opByte = &HE3 Or (opByte >= &H70 And opByte <= &H7F) Then
+                Return False   ' short rel8 branch — refuse rather than risk an out-of-range relocation
+            End If
+
+            Dim isRel32 As Boolean
+            isRel32 = False
+            If opByte = &HE8 Or opByte = &HE9 Then
+                isRel32 = True
+            ElseIf opByte = &H0F And opcodeOffset + 1 < instrLen Then
+                If buf(opcodeOffset + 1) >= &H80 And buf(opcodeOffset + 1) <= &H8F Then
+                    isRel32 = True
+                End If
+            End If
+
+            WriteBytes dstAddr, buf, instrLen
+
+            If isRel32 Then
+                Dim relOffset As Long
+                relOffset = instrLen - 4
+                Dim origDisp As Long
+                RtlMoveMemory ByVal VarPtr(origDisp), ByVal VarPtr(buf(relOffset)), 4
+                Dim origTarget As LongPtr
+                origTarget = srcAddr + CLngPtr(instrLen) + CLngPtr(origDisp)
+                Dim newDisp As Long
+                If Not TryComputeRelDisp(origTarget, dstAddr, instrLen, newDisp) Then
+                    Return False
+                End If
+                WriteDWord dstAddr + CLngPtr(relOffset), newDisp
+                Return True
+            End If
+
+        #If Win64 Then
+            ' ModRM mod=00/rm=101 = RIP-relative on x64. On x86 the same pattern
+            ' is [disp32] absolute — already correct as copied, nothing to do.
+            Dim modrmOffset As Long
+            If opByte = &H0F Then
+                modrmOffset = opcodeOffset + 2
+            Else
+                modrmOffset = opcodeOffset + 1
+            End If
+
+            If modrmOffset < instrLen Then
+                Dim modrm As Byte
+                modrm = buf(modrmOffset)
+                If (modrm And &HC7) = &H5 Then
+                    Dim dispOffset As Long
+                    dispOffset = modrmOffset + 1
+                    If dispOffset + 4 <= instrLen Then
+                        Dim origDisp2 As Long
+                        RtlMoveMemory ByVal VarPtr(origDisp2), ByVal VarPtr(buf(dispOffset)), 4
+                        Dim origTarget2 As LongPtr
+                        origTarget2 = srcAddr + CLngPtr(instrLen) + CLngPtr(origDisp2)
+                        ' RIP-relative ModRM case
+                        Dim newDisp2 As Long
+                        If Not TryComputeRelDisp(origTarget2, dstAddr, instrLen, newDisp2) Then
+                            Return False
+                        End If
+                        WriteDWord dstAddr + CLngPtr(dispOffset), newDisp2
+                    End If
+                End If
+            End If
+        #End If
+
+            Return True
+        End Function
+
+
+        Private Function BuildTrampoline(ByVal targetAddr As LongPtr, _
+            ByRef stolenLen As Long, ByVal patchSize As Long) As LongPtr
+
+            Dim offsets(0 To 15) As Long
+            Dim count As Long, total As Long
+            count = 0
+            total = 0
+
+            Do While total < patchSize
+                If count > 15 Then
+                    Return 0
+                End If
+                offsets(count) = total
+                Dim curLen As Long
+                curLen = InstructionLength(targetAddr + CLngPtr(total))
+                If curLen <= 0 Or curLen > 15 Then
+                    Return 0
+                End If
+                total = total + curLen
+                count = count + 1
+            Loop
+            stolenLen = total
+
+            Dim trampolineSize As Long
+            trampolineSize = stolenLen + patchSize
+
             Dim tAddr As LongPtr
             tAddr = AllocNearby(targetAddr, trampolineSize)
             If tAddr = 0 Then
-                BuildTrampoline = 0
-                Exit Function
+                Return 0
             End If
 
-            ' Write the saved original bytes
-            WriteBytes tAddr, origBytes, patchSize
+            Dim i As Long
+            For i = 0 To count - 1
+                Dim thisLen As Long
+                If i < count - 1 Then
+                    thisLen = offsets(i + 1) - offsets(i)
+                Else
+                    thisLen = stolenLen - offsets(i)
+                End If
+                If Not CopyRelocatedInstruction(targetAddr + CLngPtr(offsets(i)), _
+                        tAddr + CLngPtr(offsets(i)), thisLen) Then
+                    VirtualFree tAddr, 0, MEM_RELEASE
+                    Return 0
+                End If
+            Next i
 
-            ' Write the jump back to (target + patchSize)
             Dim resumeAddr As LongPtr
-            resumeAddr = targetAddr + CLngPtr(patchSize)
+            resumeAddr = targetAddr + CLngPtr(stolenLen)
 
-            If Is64Bit() Then
-                Dim backPatch64() As Byte
-                backPatch64 = BuildPatchX64(resumeAddr)
-                WriteBytes tAddr + CLngPtr(patchSize), backPatch64, PATCH_SIZE_X64
-            Else
-                Dim backPatch32() As Byte
-                backPatch32 = BuildPatchX86(tAddr + CLngPtr(patchSize), resumeAddr)
-                WriteBytes tAddr + CLngPtr(patchSize), backPatch32, PATCH_SIZE_X86
-            End If
+        #If Win64 Then
+            Dim backPatch() As Byte
+            backPatch = BuildPatchX64(resumeAddr)
+        #Else
+            Dim backPatch() As Byte
+            backPatch = BuildPatchX86(tAddr + CLngPtr(stolenLen), resumeAddr)
+        #End If
+            WriteBytes tAddr + CLngPtr(stolenLen), backPatch, patchSize
 
             FlushInstructionCache GetCurrentProcess(), tAddr, CLngPtr(trampolineSize)
-            BuildTrampoline = tAddr
+            Return tAddr
         End Function
-        
+ 
+        #If Win64 Then
+        Private Function InstructionLength(ByVal address As LongPtr) As Long
+            Dim b As Byte
+            Dim p As LongPtr
+            Dim start As LongPtr
+            Dim hasREX As Boolean
+            Dim rexW As Boolean
+            Dim op As Byte
+            Dim modRM As Byte
+            Dim mod_ As Byte
+            Dim rm As Byte
+            Dim hasSIB As Boolean
+            Dim dispSize As Long
+            Dim immSize As Long
+            Dim opSize As Long ' operand size (default 32, REX.W = 64, 66h prefix = 16)
+    
+            start = address
+            p = address
+            opSize = 32
+    
+            ' 1. Consume prefixes
+            Dim consuming As Boolean
+            consuming = True
+            Do While consuming
+                CopyMemory b, ByVal p, 1
+                Select Case b
+                    Case &HF0, &HF2, &HF3  ' LOCK, REPNE, REP
+                        p = p + 1
+                    Case &H66               ' operand size override
+                        opSize = 16
+                        p = p + 1
+                    Case &H67               ' address size override
+                        p = p + 1
+                    Case &H2E, &H3E, &H26, &H64, &H65  ' segment overrides
+                        p = p + 1
+                    Case &H40 To &H4F       ' REX
+                        hasREX = True
+                        rexW = (b And &H8) <> 0
+                        If rexW Then opSize = 64
+                        p = p + 1
+                    Case &HC4, &HC5         ' VEX 3/2 byte - punt to 3rd party
+                        InstructionLength = 0
+                        Exit Function
+                    Case &H62               ' EVEX - punt to 3rd party
+                        InstructionLength = 0
+                        Exit Function
+                    Case Else
+                        consuming = False
+                End Select
+            Loop
+    
+            ' 2. Read opcode
+            CopyMemory op, ByVal p, 1
+            p = p + 1
+    
+            Dim twoByteOp As Boolean
+            If op = &HF Then
+                twoByteOp = True
+                CopyMemory op, ByVal p, 1
+                p = p + 1
+            End If
+    
+            ' 3. Determine ModRM, displacement, immediate sizes
+            dispSize = 0
+            immSize = 0
+    
+            If twoByteOp Then
+                ' Common 0F opcodes
+                Select Case op
+                    Case &H80 To &H8F   ' Jcc rel32
+                        immSize = 4
+                    Case &HB6, &HB7, &HBE, &HBF  ' MOVZX, MOVSX - has ModRM
+                        GoTo ReadModRM
+                    Case &H10, &H11, &H12, &H13  ' SSE MOV - has ModRM
+                        GoTo ReadModRM
+                    Case Else
+                        GoTo ReadModRM  ' assume ModRM for unknown 0F opcodes
+                End Select
+            Else
+                Select Case op
+                    ' No ModRM, no immediate
+                    Case &H90                           ' NOP
+                    Case &H50 To &H5F                   ' PUSH/POP reg
+                    Case &H70 To &H7F                   ' Jcc rel8
+                        immSize = 1
+                    Case &HEB                           ' JMP rel8
+                        immSize = 1
+                    Case &HE9                           ' JMP rel32
+                        immSize = 4
+                    Case &HE8                           ' CALL rel32
+                        immSize = 4
+                    Case &HB0 To &HB7                   ' MOV r8, imm8
+                        immSize = 1
+                    Case &HB8 To &HBF                   ' MOV r64/32, imm
+                        If opSize = 64 Then
+                            immSize = 8
+                        Else
+                            immSize = 4
+                        End If
+                    Case &H68                           ' PUSH imm32
+                        immSize = 4
+                    Case &H6A                           ' PUSH imm8
+                        immSize = 1
+                    Case &HA0, &HA1, &HA2, &HA3        ' MOV moffs
+                        immSize = 8  ' 64-bit address
+                    Case &HC3, &HCB                     ' RET
+                    Case &HCC, &HCD                     ' INT
+                        If op = &HCD Then immSize = 1
+                    Case &H40 To &H48                   ' INC/DEC (32-bit mode only, REX in 64)
+                    Case &HF1                           ' INT1
+                    Case &H9C, &H9D                     ' PUSHF/POPF
+                    ' Has ModRM, no immediate
+                    Case &H0 To &H3, &H8 To &HB        ' ADD, OR
+                        GoTo ReadModRM
+                    Case &H10 To &H13, &H18 To &H1B    ' ADC, SBB
+                        GoTo ReadModRM
+                    Case &H20 To &H23, &H28 To &H2B    ' AND, SUB
+                        GoTo ReadModRM
+                    Case &H30 To &H33, &H38 To &H3B    ' XOR, CMP
+                        GoTo ReadModRM
+                    Case &H84 To &H8E                   ' TEST, XCHG, MOV, LEA etc
+                        GoTo ReadModRM
+                    Case &HF6, &HF7                     ' TEST/NOT/NEG/MUL/DIV
+                        GoTo ReadModRM
+                    Case &HFE, &HFF                     ' INC/DEC/CALL/JMP/PUSH mem
+                        GoTo ReadModRM
+                    Case &HD0 To &HD3                   ' Shift/rotate
+                        GoTo ReadModRM
+                    Case &HC0, &HC1                     ' Shift imm8
+                        GoTo ReadModRM
+                        ' (immSize set after ModRM)
+                    Case &H80, &H81, &H83               ' ADD/OR/ADC... imm
+                        GoTo ReadModRM
+                        ' (immSize set after ModRM)
+                    Case Else
+                        ' Unknown - return 0 to signal failure
+                        InstructionLength = 0
+                        Exit Function
+                End Select
+                GoTo Done
+            End If
+    
+       ReadModRM:
+            CopyMemory modRM, ByVal p, 1
+            p = p + 1
+            mod_ = (modRM And &HC0) \ &H40
+            rm = modRM And &H7
+    
+            ' SIB byte
+            hasSIB = (mod_ <> 3) And (rm = 4)
+            If hasSIB Then p = p + 1
+    
+            ' Displacement
+            If mod_ = 1 Then
+                dispSize = 1
+            ElseIf mod_ = 2 Then
+                dispSize = 4
+            ElseIf mod_ = 0 And rm = 5 Then
+                dispSize = 4  ' RIP-relative
+            End If
+            p = p + dispSize
+    
+            ' Immediates that follow ModRM
+            Select Case op
+                Case &H80, &HC0, &HC1  ' imm8
+                    immSize = 1
+                Case &H81               ' imm16/32
+                    If opSize = 16 Then immSize = 2 Else immSize = 4
+                Case &H83               ' sign-extended imm8
+                    immSize = 1
+            End Select
+
+       Done:
+            p = p + immSize
+            InstructionLength = CLng(p - start)
+        End Function
+        #Else
+        Private Function InstructionLength(ByVal address As LongPtr) As Long
+            Dim b As Byte
+            Dim p As LongPtr
+            Dim start As LongPtr
+            Dim op As Byte
+            Dim modRM As Byte
+            Dim mod_ As Byte
+            Dim rm As Byte
+            Dim dispSize As Long
+            Dim immSize As Long
+            Dim opSize As Long      ' default 32
+            Dim addrSize As Long    ' default 32
+            Dim hasSIB As Boolean
+
+            start = address
+            p = address
+            opSize = 32
+            addrSize = 32
+
+            ' 1. Consume prefixes
+            Dim consuming As Boolean
+            consuming = True
+            Do While consuming
+                CopyMemory b, ByVal p, 1
+                Select Case b
+                    Case &HF0, &HF2, &HF3
+                        p = p + 1
+                    Case &H66
+                        opSize = 16
+                        p = p + 1
+                    Case &H67
+                        addrSize = 16
+                        p = p + 1
+                    Case &H2E, &H3E, &H26, &H36, &H64, &H65
+                        p = p + 1
+                    Case Else
+                        consuming = False
+                End Select
+            Loop
+
+            ' 2. Read opcode
+            CopyMemory op, ByVal p, 1
+            p = p + 1
+
+            Dim twoByteOp As Boolean
+            If op = &HF Then
+                twoByteOp = True
+                CopyMemory op, ByVal p, 1
+                p = p + 1
+            End If
+
+            dispSize = 0
+            immSize = 0
+
+            If twoByteOp Then
+                Select Case op
+                    Case &H80 To &H8F       ' Jcc rel32
+                        immSize = 4
+                    Case &HB6, &HB7         ' MOVZX r, r/m8/16
+                        GoTo ReadModRM
+                    Case &HBE, &HBF         ' MOVSX r, r/m8/16
+                        GoTo ReadModRM
+                    Case &HA0 To &HA3       ' SHLD/SHRD imm8
+                        GoTo ReadModRM
+                        immSize = 1
+                    Case &HBA               ' BT/BTS/BTR/BTC r/m, imm8
+                        GoTo ReadModRM
+                        immSize = 1
+                    Case &H0 To &H3         ' SLDT/STR/LLDT etc, LAR/LSL
+                        GoTo ReadModRM
+                    Case &H10 To &H17       ' SSE MOV
+                        GoTo ReadModRM
+                    Case &H18               ' PREFETCH
+                        GoTo ReadModRM
+                    Case &H1F               ' NOP r/m
+                        GoTo ReadModRM
+                    Case &H28 To &H2F       ' SSE
+                        GoTo ReadModRM
+                    Case &H40 To &H4F       ' CMOVcc
+                        GoTo ReadModRM
+                    Case &H51 To &H5F       ' SSE
+                        GoTo ReadModRM
+                    Case &H60 To &H76       ' MMX
+                        GoTo ReadModRM
+                    Case &H90 To &H9F       ' SETcc r/m8
+                        GoTo ReadModRM
+                    Case &HAF               ' IMUL r, r/m
+                        GoTo ReadModRM
+                    Case &HB0, &HB1         ' CMPXCHG
+                        GoTo ReadModRM
+                    Case &HB2, &HB4, &HB5   ' LSS/LFS/LGS
+                        GoTo ReadModRM
+                    Case &HC0, &HC1         ' XADD
+                        GoTo ReadModRM
+                    Case &HC2               ' CMPSS/SD imm8
+                        GoTo ReadModRM
+                        immSize = 1
+                    Case &HC4 To &HC6       ' PINSRW etc imm8
+                        GoTo ReadModRM
+                        immSize = 1
+                    Case &HD0 To &HDF       ' MMX/SSE
+                        GoTo ReadModRM
+                    Case &HE0 To &HEF       ' MMX/SSE
+                        GoTo ReadModRM
+                    Case &HF0 To &HFE       ' MMX/SSE
+                        GoTo ReadModRM
+                    Case Else
+                        InstructionLength = 0
+                        Exit Function
+                End Select
+            Else
+                Select Case op
+                    Case &H90               ' NOP
+                    Case &H50 To &H5F       ' PUSH/POP reg
+                    Case &H60, &H61         ' PUSHA/POPA
+                    Case &H9C, &H9D         ' PUSHF/POPF
+                    Case &H9E, &H9F         ' SAHF/LAHF
+                    Case &HA4 To &HA7       ' MOVS/CMPS
+                    Case &HAA To &HAF       ' STOS/LODS/SCAS
+                    Case &HC3, &HCB         ' RET
+                    Case &HF1               ' INT1
+                    Case &HF4               ' HLT
+                    Case &HF5               ' CMC
+                    Case &HF8 To &HFC       ' CLC/STC/CLI/STI/CLD/STD
+                    Case &H98, &H99         ' CBW/CWD
+                    Case &H9B               ' WAIT
+                    Case &HD7               ' XLAT
+
+                    Case &H70 To &H7F       ' Jcc rel8
+                        immSize = 1
+                    Case &HEB               ' JMP rel8
+                        immSize = 1
+                    Case &HE0 To &HE3       ' LOOPNE/LOOPE/LOOP/JCXZ rel8
+                        immSize = 1
+                    Case &HE9               ' JMP rel32
+                        immSize = 4
+                    Case &HE8               ' CALL rel32
+                        immSize = 4
+                    Case &H9A               ' CALL far ptr
+                        immSize = 6
+                    Case &HEA               ' JMP far ptr
+                        immSize = 6
+
+                    Case &HCC               ' INT3
+                    Case &HCD               ' INT imm8
+                        immSize = 1
+                    Case &HCE               ' INTO
+
+                    Case &HC2               ' RET imm16
+                        immSize = 2
+                    Case &HCA               ' RETF imm16
+                        immSize = 2
+
+                    Case &HD4               ' AAM imm8
+                        immSize = 1
+                    Case &HD5               ' AAD imm8
+                        immSize = 1
+
+                    Case &HE4, &HE5         ' IN eAX, imm8
+                        immSize = 1
+                    Case &HE6, &HE7         ' OUT imm8, eAX
+                        immSize = 1
+
+                    Case &HA0, &HA1         ' MOV AL/eAX, moffs
+                        immSize = 4
+                    Case &HA2, &HA3         ' MOV moffs, AL/eAX
+                        immSize = 4
+
+                    Case &HB0 To &HB7       ' MOV r8, imm8
+                        immSize = 1
+                    Case &HB8 To &HBF       ' MOV r32, imm32 (or r16 with 66h)
+                        If opSize = 16 Then immSize = 2 Else immSize = 4
+
+                    Case &H68               ' PUSH imm32
+                        If opSize = 16 Then immSize = 2 Else immSize = 4
+                    Case &H6A               ' PUSH imm8
+                        immSize = 1
+
+                    Case &H6B               ' IMUL r, r/m, imm8
+                        GoTo ReadModRM
+                        immSize = 1
+                    Case &H69               ' IMUL r, r/m, imm32
+                        GoTo ReadModRM
+                        If opSize = 16 Then immSize = 2 Else immSize = 4
+
+                    ' ModRM, no immediate
+                    Case &H0 To &H3, &H8 To &HB
+                        GoTo ReadModRM
+                    Case &H10 To &H13, &H18 To &H1B
+                        GoTo ReadModRM
+                    Case &H20 To &H23, &H28 To &H2B
+                        GoTo ReadModRM
+                    Case &H30 To &H33, &H38 To &H3B
+                        GoTo ReadModRM
+                    Case &H84 To &H8E
+                        GoTo ReadModRM
+                    Case &HF6, &HF7
+                        GoTo ReadModRM
+                    Case &HFE, &HFF
+                        GoTo ReadModRM
+                    Case &HD0 To &HD3
+                        GoTo ReadModRM
+                    Case &H62, &H63         ' BOUND, ARPL
+                        GoTo ReadModRM
+                    Case &H8F               ' POP r/m
+                        GoTo ReadModRM
+
+                    ' ModRM + imm8
+                    Case &HC0, &HC1         ' Shift r/m, imm8
+                        GoTo ReadModRM
+                        immSize = 1
+                    Case &H80               ' ADD/OR/ADC... r/m, imm8
+                        GoTo ReadModRM
+                        immSize = 1
+                    Case &H83               ' ADD/OR/ADC... r/m, sign-ext imm8
+                        GoTo ReadModRM
+                        immSize = 1
+
+                    ' ModRM + imm16/32
+                    Case &H81               ' ADD/OR/ADC... r/m, imm
+                        GoTo ReadModRM
+                        If opSize = 16 Then immSize = 2 Else immSize = 4
+
+                    Case &HC4, &HC5         ' LES/LDS
+                        GoTo ReadModRM
+
+                    Case &HD8 To &HDF       ' FPU ESC
+                        GoTo ReadModRM
+
+                    Case Else
+                        InstructionLength = 0
+                        Exit Function
+                End Select
+                GoTo Done
+            End If
+
+       ReadModRM:
+            CopyMemory modRM, ByVal p, 1
+            p = p + 1
+            mod_ = (modRM And &HC0) \ &H40
+            rm = modRM And &H7
+
+            If addrSize = 16 Then
+                ' 16-bit addressing modes - no SIB
+                If mod_ = 1 Then
+                    dispSize = 1
+                ElseIf mod_ = 2 Then
+                    dispSize = 2
+                ElseIf mod_ = 0 And rm = 6 Then
+                    dispSize = 2  ' direct address
+                End If
+            Else
+                ' 32-bit addressing modes
+                hasSIB = (mod_ <> 3) And (rm = 4)
+                If hasSIB Then p = p + 1
+
+                If mod_ = 1 Then
+                    dispSize = 1
+                ElseIf mod_ = 2 Then
+                    dispSize = 4
+                ElseIf mod_ = 0 And rm = 5 Then
+                    dispSize = 4  ' disp32 direct
+                End If
+            End If
+            p = p + dispSize
+
+       Done:
+            p = p + immSize
+            InstructionLength = CLng(p - start)
+        End Function
+        #End If
         ' ------------------------------------------------------------------ '
         '  Public API                                                         '
         ' ------------------------------------------------------------------ '
@@ -325,7 +923,8 @@ Module APIHook
 
             ' Build trampoline (call this to invoke the real function)
             Dim trampoline As LongPtr
-            trampoline = BuildTrampoline(targetAddr, origBytes, patchSize)
+            Dim stolen As Long
+            trampoline = BuildTrampoline(targetAddr, stolen, patchSize)
             If trampoline = 0 Then Exit Function
 
             ' Build and write the detour patch
